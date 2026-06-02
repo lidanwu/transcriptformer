@@ -1,0 +1,55 @@
+defaults:
+  - _self_
+
+model:
+  checkpoint_path: null
+  model_type: "transcriptformer"
+
+  data_config:
+    _target_: transcriptformer.data.dataclasses.DataConfig
+    gene_col_name: "ensembl_id"
+    clip_counts: 30            # not used by imputation (counts are taken from AnnData and sequence assembly)
+    filter_to_vocabs: true
+    filter_outliers: 0.0       # not used by imputation (cell filtering uses min_expressed_genes only)
+    pad_zeros: false           # not used by imputation (use imputation_config.include_zero_observed)
+    normalize_to_scale: 0      # not used by imputation
+    sort_genes: true        # Whether to sort genes by expression level
+    randomize_genes: false
+    min_expressed_genes: 200     # Minimum observed genes required per cell; null means inherit checkpoint value
+    use_raw: "auto"            # Use .raw.X (True), .X (False), or auto; null means inherit checkpoint value
+    remove_duplicate_genes: false   # Remove duplicate genes instead of raising
+    n_data_workers: 0          # not used by imputation (no DataLoader workers in direct file loop)
+
+  imputation_config:
+    # Runtime/model-loading and I/O controls for imputation
+    data_files: []
+    output_path: ./imputation_results
+    output_filename: imputed_query_genes.h5ad
+    batch_size: 8
+    obs_keys:
+      - all
+    load_checkpoint: null
+    device: auto
+    pretrained_embedding: null
+
+    # Query gene selection
+    query_genes: []
+    query_genes_file: null
+
+    # Iterative refinement controls
+    num_iters: 3
+    eps: 1e-6
+
+    # Sequence construction controls
+    include_zero_observed: false    # include zero-count non-query genes as observed context
+    treat_query_as_missing: true
+    seed_query_with_observed_counts: false  # when treating query as missing, warm-start query counts from observed values
+
+    # Library size controls for unconstrained/full-profile upsampling (no observed anchors)
+    # Constrained imputation keeps observed genes anchored and infers missing mass from mu ratio.
+    total_count_obs_key: null
+    total_count_value: null
+    count_scale: null
+    observed_fraction: null
+
+    seed: 42

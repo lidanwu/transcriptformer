@@ -439,6 +439,160 @@ class Transcriptformer(pl.LightningModule):
         results.update({key: transformer_output[key] for key in self.inference_config.output_keys})
         return results
 
+    @torch.no_grad()
+    def impute_gene_expression(
+        self,
+        batch: BatchData,
+        observed_mask: torch.Tensor,
+        query_gene_ids: list[int] | torch.Tensor | None = None,
+        total_counts: float | torch.Tensor | None = None,
+        count_scale: float | torch.Tensor | None = None,
+        observed_fraction: float | torch.Tensor | None = None,
+        initial_missing_counts: torch.Tensor | None = None,
+        num_iters: int = 2,
+        eps: float = 1e-6,
+    ) -> dict:
+        """Impute missing expression from partial counts for genes in a sequence.
+
+        This routine assumes ``observed_mask`` indicates known non-padding positions.
+        Missing positions are iteratively filled from the model's ``mu`` predictions.
+
+        For constrained imputation (at least one observed gene in a cell), observed
+        counts remain anchored and missing mass is inferred from the model-predicted
+        missing/observed ratio. Explicit total-depth controls are only applied when
+        a cell has no observed genes (full-profile generation/upsampling mode).
+
+        Args:
+            batch: Input batch containing ``gene_counts`` and ``gene_token_indices``.
+            observed_mask: Boolean tensor with ``True`` at observed genes.
+            query_gene_ids: Optional subset of gene token ids to extract.
+            total_counts: Optional target library size per cell (scalar or [batch]).
+            count_scale: Optional multiplier on observed totals when ``total_counts``
+                is not provided.
+            observed_fraction: Optional observed fraction in (0, 1], used as
+                ``target_total = observed_total / observed_fraction`` when provided.
+            initial_missing_counts: Optional warm-start values for missing genes,
+                same shape as ``gene_counts``.
+            num_iters: Number of refinement iterations.
+            eps: Numerical stability constant.
+
+        Returns
+        -------
+            dict with ``imputed_counts`` (full sequence), ``mu`` (decoder output),
+            and optional ``query_counts``/``query_mask`` when ``query_gene_ids`` is set.
+        """
+        if observed_mask.dtype is not torch.bool:
+            observed_mask = observed_mask.bool()
+
+        device = batch.gene_counts.device
+        gene_counts = batch.gene_counts
+        gene_token_indices = batch.gene_token_indices
+        valid_mask = self._pad_mask(gene_token_indices, dtype="bool")
+        observed_mask = observed_mask.to(device) & valid_mask
+
+        if observed_mask.shape != gene_counts.shape:
+            raise ValueError("observed_mask must have the same shape as batch.gene_counts")
+
+        if num_iters < 1:
+            raise ValueError("num_iters must be >= 1")
+
+        observed_counts = gene_counts * observed_mask.float()
+        observed_total = observed_counts.sum(dim=1)
+        has_observed = observed_mask.any(dim=1)
+
+        has_explicit_total = total_counts is not None or observed_fraction is not None or count_scale is not None
+
+        if total_counts is not None:
+            explicit_target_total = torch.as_tensor(total_counts, dtype=gene_counts.dtype, device=device)
+        elif observed_fraction is not None:
+            frac = torch.as_tensor(observed_fraction, dtype=gene_counts.dtype, device=device)
+            explicit_target_total = observed_total / torch.clamp(frac, min=eps)
+        elif count_scale is not None:
+            scale = torch.as_tensor(count_scale, dtype=gene_counts.dtype, device=device)
+            explicit_target_total = observed_total * scale
+        else:
+            explicit_target_total = None
+
+        if explicit_target_total is not None and explicit_target_total.ndim == 0:
+            explicit_target_total = explicit_target_total.expand_as(observed_total)
+
+        # Keep observed genes anchored in constrained mode.
+        known_counts = observed_counts
+
+        missing_mask = valid_mask & ~observed_mask
+        if initial_missing_counts is not None:
+            if initial_missing_counts.shape != gene_counts.shape:
+                raise ValueError("initial_missing_counts must have the same shape as batch.gene_counts")
+            missing_counts = initial_missing_counts.to(device=device, dtype=gene_counts.dtype) * missing_mask.float()
+        else:
+            missing_counts = torch.zeros_like(gene_counts)
+        final_output = None
+
+        was_training = self.training
+        self.eval()
+        try:
+            for _ in range(num_iters):
+                current_counts = known_counts + missing_counts
+                impute_batch = BatchData(
+                    gene_counts=current_counts,
+                    gene_token_indices=gene_token_indices,
+                    aux_token_indices=batch.aux_token_indices,
+                    file_path=batch.file_path,
+                    obs=batch.obs,
+                )
+
+                final_output = self.forward(batch=impute_batch, embed=False)
+                mu = final_output["mu"]
+
+                pred_missing = mu * missing_mask.float()
+                pred_missing_sum = pred_missing.sum(dim=1)
+
+                pred_observed = mu * observed_mask.float()
+                pred_observed_sum = pred_observed.sum(dim=1)
+                observed_mass = known_counts.sum(dim=1)
+                ratio = pred_missing_sum / torch.clamp(pred_observed_sum, min=eps)
+                missing_budget = observed_mass * ratio
+
+                # Apply explicit totals only to unconstrained rows (no observed genes).
+                if has_explicit_total:
+                    no_observed = ~has_observed
+                    if no_observed.any():
+                        if explicit_target_total is not None:
+                            missing_budget = torch.where(no_observed, explicit_target_total, missing_budget)
+                        else:
+                            # Fallback for rows without observed genes when only ratio-based
+                            # controls are unavailable: keep decoder scale.
+                            missing_budget = torch.where(no_observed, pred_missing_sum, missing_budget)
+
+                missing_scale = missing_budget / torch.clamp(pred_missing_sum, min=eps)
+                missing_counts = pred_missing * missing_scale.unsqueeze(1)
+                missing_counts = missing_counts.masked_fill(~missing_mask, 0.0)
+        finally:
+            if was_training:
+                self.train()
+
+        imputed_counts = known_counts + missing_counts
+        target_total = imputed_counts.sum(dim=1)
+
+        result = {
+            "imputed_counts": imputed_counts,
+            "mu": final_output["mu"],
+            "observed_mask": observed_mask,
+            "valid_mask": valid_mask,
+            "target_total": target_total,
+        }
+
+        if query_gene_ids is not None:
+            if isinstance(query_gene_ids, list):
+                query_gene_ids = torch.tensor(query_gene_ids, device=device)
+            else:
+                query_gene_ids = query_gene_ids.to(device)
+            query_mask = torch.isin(gene_token_indices, query_gene_ids) & valid_mask
+            result["query_mask"] = query_mask
+            result["query_counts"] = imputed_counts.masked_fill(~query_mask, float("nan"))
+
+        return result
+
     def _resize_data(self, data, config_batch_size):
         """
         Resize batch to match model batch_size.

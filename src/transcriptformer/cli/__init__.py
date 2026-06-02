@@ -12,6 +12,7 @@ Usage:
 
 Commands:
     inference      Run inference with a TranscriptFormer model
+    impute         Impute expression for configured query genes
     download       Download and extract TranscriptFormer model artifacts
     download-data  Download CellxGene Discover datasets by species
 
@@ -238,6 +239,94 @@ def setup_download_parser(subparsers):
         "--checkpoint-dir",
         default="./checkpoints",
         help="Directory to store the downloaded checkpoints (default: ./checkpoints)",
+    )
+
+
+def setup_impute_parser(subparsers):
+    """Setup parser for the impute command."""
+    parser = subparsers.add_parser(
+        "impute",
+        help="Run gene expression imputation for selected query genes",
+        description="Impute expression values for query genes using TranscriptFormer.",
+    )
+
+    parser.add_argument("--checkpoint-path", required=True, help="Path to model checkpoint directory")
+    parser.add_argument("--data-file", action="append", required=True, help="Input .h5ad file (repeatable)")
+    parser.add_argument(
+        "--query-genes",
+        default="",
+        help="Comma-separated query genes to impute (can be combined with --query-genes-file)",
+    )
+    parser.add_argument("--query-genes-file", default=None, help="Text file with one query gene per line")
+    parser.add_argument("--output-path", default="./imputation_results", help="Output directory")
+    parser.add_argument("--output-filename", default="imputed_query_genes.h5ad", help="Output filename")
+    parser.add_argument("--batch-size", type=int, default=8, help="Imputation batch size")
+    parser.add_argument("--num-iters", type=int, default=3, help="Number of iterative update steps")
+    parser.add_argument(
+        "--treat-query-as-missing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Treat query genes as missing and impute them even if observed in input",
+    )
+    parser.add_argument(
+        "--seed-query-with-observed-counts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When treating query as missing, initialize query counts from observed values if available",
+    )
+    parser.add_argument(
+        "--include-zero-observed",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Allow zero-count non-query genes as observed context tokens",
+    )
+    parser.add_argument("--count-scale", type=float, default=None, help="Scale observed total counts by this factor")
+    parser.add_argument("--observed-fraction", type=float, default=None, help="Observed fraction in (0,1]")
+    parser.add_argument("--total-count-obs-key", default=None, help="obs column containing target total count")
+    parser.add_argument("--total-count-value", type=float, default=None, help="Global target total count")
+    parser.add_argument("--gene-col-name", default="ensembl_id", help="Gene ID column in AnnData.var")
+    parser.add_argument(
+        "--filter-to-vocabs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Whether to drop genes not present in model vocabulary",
+    )
+    parser.add_argument("--min-expressed-genes", type=int, default=None, help="Minimum observed genes required per cell")
+    parser.add_argument(
+        "--sort-genes",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Sort observed genes by count before sequence construction",
+    )
+    parser.add_argument(
+        "--randomize-genes",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Randomize observed-gene order before sequence construction",
+    )
+    parser.add_argument(
+        "--use-raw",
+        type=lambda x: None if x.lower() == "auto" else x.lower() == "true",
+        default=None,
+        help="Whether to use raw counts from AnnData.raw.X (True), adata.X (False), or auto (default: auto)",
+    )
+    parser.add_argument(
+        "--remove-duplicate-genes",
+        action="store_true",
+        default=False,
+        help="Remove duplicate genes if found instead of raising an error",
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Device preference for model execution",
+    )
+    parser.add_argument(
+        "--config-override",
+        action="append",
+        default=[],
+        help="Override config values. Format: key.path=value (repeatable)",
     )
 
 
@@ -549,6 +638,74 @@ def run_download_data_cli(args):
         sys.exit(1)
 
 
+def run_impute_cli(args):
+    """Run imputation using command line arguments."""
+    from transcriptformer.model.imputation import load_and_merge_with_checkpoint, run_imputation
+
+    config_path = os.path.join(os.path.dirname(__file__), "conf", "imputation_config.yaml")
+    cfg = OmegaConf.load(config_path)
+
+    cfg.model.checkpoint_path = args.checkpoint_path
+    cfg.model.imputation_config.data_files = args.data_file
+    cfg.model.imputation_config.output_path = args.output_path
+    cfg.model.imputation_config.output_filename = args.output_filename
+    cfg.model.imputation_config.batch_size = args.batch_size
+    cfg.model.imputation_config.num_iters = args.num_iters
+    cfg.model.imputation_config.treat_query_as_missing = args.treat_query_as_missing
+    cfg.model.imputation_config.seed_query_with_observed_counts = args.seed_query_with_observed_counts
+    cfg.model.imputation_config.include_zero_observed = args.include_zero_observed
+    cfg.model.imputation_config.count_scale = args.count_scale
+    cfg.model.imputation_config.observed_fraction = args.observed_fraction
+    cfg.model.imputation_config.total_count_obs_key = args.total_count_obs_key
+    cfg.model.imputation_config.total_count_value = args.total_count_value
+    cfg.model.imputation_config.query_genes_file = args.query_genes_file
+    cfg.model.data_config.gene_col_name = args.gene_col_name
+    cfg.model.data_config.use_raw = args.use_raw
+    cfg.model.data_config.remove_duplicate_genes = args.remove_duplicate_genes
+    cfg.model.imputation_config.device = args.device
+
+    if args.filter_to_vocabs is not None:
+        cfg.model.data_config.filter_to_vocabs = args.filter_to_vocabs
+    if args.min_expressed_genes is not None:
+        cfg.model.data_config.min_expressed_genes = args.min_expressed_genes
+    if args.sort_genes is not None:
+        cfg.model.data_config.sort_genes = args.sort_genes
+    if args.randomize_genes is not None:
+        cfg.model.data_config.randomize_genes = args.randomize_genes
+
+    query_genes = [gene.strip() for gene in args.query_genes.split(",") if gene.strip()]
+    cfg.model.imputation_config.query_genes = query_genes
+
+    for override in args.config_override:
+        if "=" not in override:
+            continue
+        key, value = override.split("=", 1)
+        try:
+            if value.lower() in ["true", "false"]:
+                value = value.lower() == "true"
+            elif value.lower() in ["none", "null"]:
+                value = None
+            elif value.isdigit():
+                value = int(value)
+            elif "." in value and all(part.isdigit() for part in value.split(".")):
+                value = float(value)
+        except Exception:
+            pass
+        OmegaConf.update(cfg, key, value)
+
+    cfg = load_and_merge_with_checkpoint(cfg)
+    adata_output = run_imputation(cfg, data_files=cfg.model.imputation_config.data_files)
+
+    os.makedirs(cfg.model.imputation_config.output_path, exist_ok=True)
+    output_filename = cfg.model.imputation_config.output_filename
+    if not output_filename.endswith(".h5ad"):
+        output_filename = f"{output_filename}.h5ad"
+
+    save_file = os.path.join(cfg.model.imputation_config.output_path, output_filename)
+    adata_output.write_h5ad(save_file)
+    print(f"Imputation completed! Saved results to {save_file}")
+
+
 def run_train_cli(args):
     """Run training from CLI args."""
     setup_runtime_for_training()
@@ -622,6 +779,7 @@ def main():
 
     # Set up parsers for each command
     setup_inference_parser(subparsers)
+    setup_impute_parser(subparsers)
     setup_download_parser(subparsers)
     setup_download_data_parser(subparsers)
     setup_train_parser(subparsers)
@@ -636,6 +794,8 @@ def main():
     # Run the appropriate command
     if args.command == "inference":
         run_inference_cli(args)
+    elif args.command == "impute":
+        run_impute_cli(args)
     elif args.command == "download":
         run_download_cli(args)
     elif args.command == "download-data":

@@ -21,6 +21,7 @@ class TestCLIIntegration:
         assert result.returncode == 0
         assert "TranscriptFormer command-line interface" in result.stdout
         assert "inference" in result.stdout
+        assert "impute" in result.stdout
         assert "download" in result.stdout
 
     def test_download_help(self):
@@ -129,3 +130,35 @@ class TestCLIMockedIntegration:
         args = mock_run_download.call_args[0][0]
         assert args.model == "all"
         assert args.checkpoint_dir == "./checkpoints"  # default
+
+    @mock.patch("transcriptformer.cli.run_impute_cli")
+    def test_impute_command(self, mock_run_impute):
+        """Test that the impute command runs with appropriate arguments."""
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "transcriptformer",
+                "impute",
+                "--checkpoint-path",
+                "/path/to/checkpoint",
+                "--data-file",
+                "/path/to/data1.h5ad",
+                "--data-file",
+                "/path/to/data2.h5ad",
+                "--query-genes",
+                "ENSG1,ENSG2",
+                "--num-iters",
+                "4",
+            ],
+        ):
+            from transcriptformer.cli import main
+
+            main()
+
+        mock_run_impute.assert_called_once()
+        args = mock_run_impute.call_args[0][0]
+        assert args.checkpoint_path == "/path/to/checkpoint"
+        assert args.data_file == ["/path/to/data1.h5ad", "/path/to/data2.h5ad"]
+        assert args.query_genes == "ENSG1,ENSG2"
+        assert args.num_iters == 4

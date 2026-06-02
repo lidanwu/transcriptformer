@@ -5,10 +5,13 @@ import sys
 from unittest import mock
 
 import pytest
+from omegaconf import OmegaConf
 
 from transcriptformer.cli import (
     main,
+    run_impute_cli,
     run_train_cli,
+    setup_impute_parser,
     setup_inference_parser,
     setup_train_parser,
 )
@@ -148,7 +151,7 @@ class TestTrainCommand:
 
         # Verify setup was called
         mock_setup_runtime.assert_called_once()
-        
+
         # Verify run_train_from_dict was called with correct config
         mock_run_train_from_dict.assert_called_once()
         call_args = mock_run_train_from_dict.call_args[0][0]
@@ -162,6 +165,126 @@ class TestTrainCommand:
         assert call_args["enable_file_aware_batching"] is True
         assert call_args["oom_batches_per_file"] == 1
         assert call_args["loss_config"]["gene_id_loss_weight"] == 1.0
+
+
+class TestImputeCommand:
+    """Tests for the impute command."""
+
+    @mock.patch("transcriptformer.cli.run_impute_cli")
+    def test_impute_command(self, mock_run_impute, monkeypatch):
+        """Test that impute command runs with required arguments."""
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "transcriptformer",
+                "impute",
+                "--checkpoint-path",
+                "/path/to/checkpoint",
+                "--data-file",
+                "/path/to/data.h5ad",
+            ],
+        )
+
+        main()
+        mock_run_impute.assert_called_once()
+
+    @mock.patch("transcriptformer.model.imputation.run_imputation")
+    @mock.patch("transcriptformer.model.imputation.load_and_merge_with_checkpoint")
+    @mock.patch("transcriptformer.cli.OmegaConf.load")
+    @mock.patch("transcriptformer.cli.os.makedirs")
+    def test_run_impute_cli(self, mock_makedirs, mock_cfg_load, mock_load_merge, mock_run_imputation):
+        """Test run_impute_cli parameter mapping and output writing."""
+        cfg = {
+            "model": {
+                "checkpoint_path": "",
+                "imputation_config": {
+                    "data_files": [],
+                    "output_path": "",
+                    "output_filename": "imputed_query_genes.h5ad",
+                    "batch_size": 8,
+                    "obs_keys": ["all"],
+                    "device": "auto",
+                    "pretrained_embedding": None,
+                    "num_iters": 3,
+                    "treat_query_as_missing": True,
+                    "seed_query_with_observed_counts": False,
+                    "include_zero_observed": False,
+                    "count_scale": None,
+                    "observed_fraction": None,
+                    "total_count_obs_key": None,
+                    "total_count_value": None,
+                    "query_genes_file": None,
+                    "query_genes": [],
+                },
+                "data_config": {
+                    "gene_col_name": "ensembl_id",
+                    "use_raw": None,
+                    "remove_duplicate_genes": False,
+                    "filter_to_vocabs": True,
+                    "min_expressed_genes": 0,
+                    "sort_genes": None,
+                    "randomize_genes": None,
+                },
+                "inference_config": {},
+            }
+        }
+        mock_cfg_load.return_value = OmegaConf.create(cfg)
+        mock_load_merge.side_effect = lambda input_cfg: input_cfg
+
+        mock_adata = mock.MagicMock()
+        mock_run_imputation.return_value = mock_adata
+
+        args = mock.MagicMock()
+        args.checkpoint_path = "/path/to/checkpoint"
+        args.data_file = ["/path/to/data.h5ad"]
+        args.query_genes = "ENSG1,ENSG2"
+        args.query_genes_file = None
+        args.output_path = "/path/to/output"
+        args.output_filename = "my_imputed"
+        args.batch_size = 4
+        args.num_iters = 5
+        args.treat_query_as_missing = True
+        args.seed_query_with_observed_counts = True
+        args.include_zero_observed = True
+        args.count_scale = 1.5
+        args.observed_fraction = 0.8
+        args.total_count_obs_key = "library_size"
+        args.total_count_value = None
+        args.gene_col_name = "ensembl_id"
+        args.filter_to_vocabs = False
+        args.min_expressed_genes = 10
+        args.sort_genes = True
+        args.randomize_genes = False
+        args.use_raw = None
+        args.remove_duplicate_genes = True
+        args.device = "cpu"
+        args.config_override = [
+            "model.data_config.min_expressed_genes=12",
+            "model.imputation_config.total_count_value=2000",
+        ]
+
+        run_impute_cli(args)
+
+        mock_load_merge.assert_called_once()
+        mapped_cfg = mock_load_merge.call_args[0][0]
+        assert mapped_cfg.model.checkpoint_path == "/path/to/checkpoint"
+        assert mapped_cfg.model.imputation_config.data_files == ["/path/to/data.h5ad"]
+        assert mapped_cfg.model.imputation_config.query_genes == ["ENSG1", "ENSG2"]
+        assert mapped_cfg.model.imputation_config.num_iters == 5
+        assert mapped_cfg.model.imputation_config.total_count_value == 2000
+        assert mapped_cfg.model.data_config.filter_to_vocabs is False
+        assert mapped_cfg.model.data_config.min_expressed_genes == 12
+        assert mapped_cfg.model.data_config.sort_genes is True
+        assert mapped_cfg.model.data_config.randomize_genes is False
+        assert mapped_cfg.model.imputation_config.device == "cpu"
+        assert mapped_cfg.model.imputation_config.batch_size == 4
+        assert mapped_cfg.model.imputation_config.output_path == "/path/to/output"
+        assert mapped_cfg.model.imputation_config.output_filename == "my_imputed"
+
+        mock_run_imputation.assert_called_once_with(mapped_cfg, data_files=["/path/to/data.h5ad"])
+        mock_makedirs.assert_called_once_with("/path/to/output", exist_ok=True)
+        mock_adata.write_h5ad.assert_called_once_with("/path/to/output/my_imputed.h5ad")
 
 
 class TestCLIParsers:
@@ -234,4 +357,36 @@ class TestCLIParsers:
             action=argparse.BooleanOptionalAction,
             default=True,
             help="Keep OOM batches mostly file-local; disable to fall back to Lightning DistributedSampler batching",
+        )
+
+    def test_impute_parser_setup(self):
+        """Test that impute parser is set up correctly."""
+        parser = mock.MagicMock()
+        subparsers = mock.MagicMock()
+        subparsers.add_parser.return_value = parser
+
+        setup_impute_parser(subparsers)
+
+        subparsers.add_parser.assert_called_once_with(
+            "impute",
+            help="Run gene expression imputation for selected query genes",
+            description="Impute expression values for query genes using TranscriptFormer.",
+        )
+
+        parser.add_argument.assert_any_call(
+            "--checkpoint-path",
+            required=True,
+            help="Path to model checkpoint directory",
+        )
+        parser.add_argument.assert_any_call(
+            "--data-file",
+            action="append",
+            required=True,
+            help="Input .h5ad file (repeatable)",
+        )
+        parser.add_argument.assert_any_call(
+            "--num-iters",
+            type=int,
+            default=3,
+            help="Number of iterative update steps",
         )

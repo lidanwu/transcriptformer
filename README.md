@@ -87,7 +87,7 @@ See the `pyproject.toml` file for the complete list of dependencies.
 
 ## Using the TranscriptFormer CLI
 
-After installing the package, you'll have access to the `transcriptformer` command-line interface (CLI), which provides easy access to download model artifacts, download training datasets, and run inference.
+After installing the package, you'll have access to the `transcriptformer` command-line interface (CLI), which provides easy access to download model artifacts, download training datasets, run inference, and run gene-expression imputation.
 
 ### Downloading Model Weights
 
@@ -256,6 +256,40 @@ transcriptformer inference \
   --batch-size 8
 ```
 
+### Running Gene Expression Imputation
+
+Use the CLI to impute selected query genes from partial observed expression context:
+
+```bash
+# Basic imputation using explicit query genes
+transcriptformer impute \
+  --checkpoint-path ./checkpoints/tf_sapiens \
+  --data-file ./data/human_val.h5ad \
+  --query-genes ENSG00000141510,ENSG00000136997 \
+  --output-path ./imputation_results
+
+# Multi-file input and query list from file
+transcriptformer impute \
+  --checkpoint-path ./checkpoints/tf_sapiens \
+  --data-file ./data/human_part1.h5ad \
+  --data-file ./data/human_part2.h5ad \
+  --query-genes-file ./queries.txt \
+  --num-iters 4 \
+  --output-filename tf_sapiens_imputed.h5ad
+
+# Respect depth target and adjust context controls
+transcriptformer impute \
+  --checkpoint-path ./checkpoints/tf_sapiens \
+  --data-file ./data/human_val.h5ad \
+  --query-genes ENSG00000141510 \
+  --total-count-value 10000 \
+  --count-scale 1.0 \
+  --sort-genes \
+  --min-expressed-genes 200
+```
+
+The `impute` command writes an AnnData output (default: `imputed_query_genes.h5ad`) with imputed values for requested query genes in `X`.
+
 ### Advanced Configuration
 
 For advanced configuration options not exposed as CLI arguments, use the `--config-override` parameter:
@@ -272,6 +306,7 @@ To see all available CLI options:
 
 ```bash
 transcriptformer inference --help
+transcriptformer impute --help
 transcriptformer download --help
 transcriptformer download-data --help
 ```
@@ -298,6 +333,30 @@ transcriptformer download-data --help
 - `--device`: Specific device to use (`auto`, `cpu`, `cuda`, `mps`). `auto` (default) defualts to `cuda` falling back on `cpu`.
 - `--disable-compile-block-mask`: Disable block mask compilation (useful for CPU/debugging)
 - `--config-override key.path=value`: Override any configuration value directly.
+
+### CLI Options for `impute`:
+
+- `--checkpoint-path PATH`: Path to model checkpoint directory (required).
+- `--data-file PATH`: Input AnnData file (repeatable; required).
+- `--query-genes STR`: Comma-separated query genes to impute.
+- `--query-genes-file PATH`: Text file with one query gene per line.
+- `--output-path DIR`: Output directory (default: `./imputation_results`).
+- `--output-filename NAME`: Output AnnData filename (default: `imputed_query_genes.h5ad`).
+- `--num-iters INT`: Number of iterative imputation updates (default: 3).
+- `--treat-query-as-missing / --no-treat-query-as-missing`: Impute queries even if observed (default: enabled).
+- `--seed-query-with-observed-counts / --no-seed-query-with-observed-counts`: Warm-start query values from observed counts (default: disabled).
+- `--include-zero-observed / --no-include-zero-observed`: Include zero-count non-query genes as observed context (default: disabled).
+- `--count-scale FLOAT`: Scale factor for observed total counts.
+- `--observed-fraction FLOAT`: Fraction of observed context in $(0, 1]$.
+- `--total-count-obs-key NAME`: `obs` column containing target total count per cell.
+- `--total-count-value FLOAT`: Global target total count.
+- `--filter-to-vocabs / --no-filter-to-vocabs`: Restrict to genes in model vocabulary.
+- `--min-expressed-genes INT`: Minimum observed-gene context size per cell.
+- `--sort-genes / --no-sort-genes`: Sort observed genes by count.
+- `--randomize-genes / --no-randomize-genes`: Randomize observed gene order.
+- `--use-raw {True,False,auto}`: Use `AnnData.raw.X`, `adata.X`, or auto selection.
+- `--device {auto,cpu,cuda,mps}`: Device preference for model execution.
+- `--config-override key.path=value`: Override config values directly.
 
 
 ### Input Data Format and Preprocessing:

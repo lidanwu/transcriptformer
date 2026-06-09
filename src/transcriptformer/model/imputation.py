@@ -324,7 +324,7 @@ def run_imputation(cfg: DictConfig, data_files: Sequence[str] | None = None) -> 
             logger.warning("Skipping failed file: %s", file_path)
             continue
 
-        gene_names, success, adata = load_gene_features(
+        gene_names, success, adata, _dedup_col_indices = load_gene_features(
             adata,
             cfg.model.data_config.gene_col_name,
             cfg.model.data_config.remove_duplicate_genes,
